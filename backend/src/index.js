@@ -4,28 +4,24 @@ import { initDb } from './models/schemas.js';
 
 const PORT = process.env.PORT || 5000;
 
-// Programmatic start for local non-Vercel environment
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-  async function startServer() {
-    try {
-      // Establish SQLite DB connection
-      const db = await getDbConnection();
-      
-      // Run migrations and seed data programmatically on start
-      await initDb(db);
-      console.log('📦 SQLite database synced, migrated, and seeded successfully.');
+async function startServer() {
+  try {
+    // Establish SQLite DB connection
+    const db = await getDbConnection();
 
-      // Start Express app listening
-      app.listen(PORT, () => {
-        console.log(`🚀 API Server successfully listening on http://localhost:${PORT}`);
-      });
-    } catch (error) {
-      console.error('❌ Critical server startup error:', error.message);
-      process.exit(1);
-    }
+    // Run migrations and seed data programmatically on start
+    await initDb(db);
+    console.log('📦 SQLite database synced, migrated, and seeded successfully.');
+
+    app.listen(PORT, () => {
+      console.log(`🚀 API Server successfully listening on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('❌ Critical server startup error:', error.message);
+    process.exit(1);
   }
-
-  startServer();
 }
+
+startServer();
 
 export default app;
