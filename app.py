@@ -562,6 +562,50 @@ IGNORE_LINE_PATTERNS = [
     r"address",
 ]
 
+ITEM_IGNORE_PATTERNS = [
+    r"\bdate\b",
+    r"\btime\b",
+    r"\bgstin\b",
+    r"\bcustomer\b",
+    r"\bpayment\b",
+    r"\bmode\b",
+    r"\btable\b",
+    r"\breceipt\b",
+    r"\btax\b",
+    r"\bsubtotal\b",
+    r"\btotal\b",
+]
+
+ADDRESS_HINT_PATTERNS = [
+    r"\broad\b",
+    r"\brd\b",
+    r"\bstreet\b",
+    r"\bst\b",
+    r"\bavenue\b",
+    r"\bave\b",
+    r"\blane\b",
+    r"\bln\b",
+    r"\bsector\b",
+    r"\bblock\b",
+    r"\bcolony\b",
+    r"\blocality\b",
+    r"\bdistrict\b",
+    r"\bvillage\b",
+    r"\bcity\b",
+    r"\bstate\b",
+    r"\bpin\b",
+    r"\bpincode\b",
+    r"\bpostal\b",
+    r"\bopp(?:osite)?\b",
+    r"\bnear\b",
+    r"\bshop\s*no\b",
+    r"\bplot\b",
+    r"\btower\b",
+    r"\bbuilding\b",
+    r"\bmall\b",
+    r"\bfloor\b",
+]
+
 
 def preprocess_receipt_image(image: Image.Image) -> Image.Image:
     if cv2 is None or np is None:
@@ -687,21 +731,92 @@ def parse_item_lines(lines: list[str], total_amount: float | None = None) -> lis
 
     item_patterns = [
         re.compile(
-            r"^\s*(?P<qty>\d+(?:\.\d+)?)\s*[xX]?\s+(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{2,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?)\s*$"
+            r"^\s*(?P<qty>\d+(?:\.\d+)?)\s*[xX]\s*(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{1,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?|\d{4,6})\s*$"
         ),
         re.compile(
-            r"^\s*(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{2,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?)\s*$"
+            r"^\s*(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{1,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?|\d{4,6})\s*$"
         ),
     ]
 
-    for line in lines:
+    def clean_item_name(value: str) -> str:
+        cleaned_value = re.sub(r"^\s*\d+(?:\.\d+)?\s*[xX]\s*", "", value or "")
+        cleaned_value = re.sub(r"^[^A-Za-z]+", "", cleaned_value)
+        cleaned_value = re.sub(r"[^A-Za-z0-9&'\-/(),.\s]+", " ", cleaned_value)
+        cleaned_value = re.sub(r"\s{2,}", " ", cleaned_value).strip(" -:.,")
+        return cleaned_value
+
+    def normalize_item_price(value: str, line_text: str) -> float | None:
+        cleaned_price = re.sub(r"[^\d.,]", "", value or "")
+        if not cleaned_price:
+            return None
+
+        if "." in cleaned_price or "," in cleaned_price:
+            parsed = normalize_amount_text(cleaned_price)
+            return parsed
+
+        digits_only = re.sub(r"\D", "", cleaned_price)
+        if not digits_only:
+            return None
+
+        if len(digits_only) >= 4:
+            parsed_value = float(f"{digits_only[:-2]}.{digits_only[-2:]}")
+        else:
+            parsed_value = float(digits_only)
+
+        if parsed_value <= 0:
+            return None
+
+        if total_amount is not None and parsed_value > (total_amount * 10):
+            return None
+
+        return parsed_value
+
+    def confidence_score(line_text: str, item_name: str, amount_value: float | None, has_qty: bool) -> float:
+        if amount_value is None:
+            return 0.0
+
+        score = 0.45
+        lower_line = line_text.lower()
+        alphabetic_count = sum(1 for char in item_name if char.isalpha())
+        digit_count = sum(1 for char in line_text if char.isdigit())
+        symbol_count = sum(1 for char in line_text if not char.isalnum() and not char.isspace())
+
+        if alphabetic_count >= 3:
+            score += 0.2
+        if alphabetic_count >= 5:
+            score += 0.1
+        if has_qty:
+            score += 0.1
+        if len(item_name.split()) >= 1:
+            score += 0.05
+        if 4 <= len(line_text) <= 60:
+            score += 0.05
+        if any(re.search(pattern, lower_line) for pattern in ADDRESS_HINT_PATTERNS):
+            score -= 0.35
+        if digit_count > 8:
+            score -= 0.15
+        if symbol_count > 5:
+            score -= 0.1
+        if any(re.search(pattern, lower_line) for pattern in ITEM_IGNORE_PATTERNS):
+            score -= 0.5
+
+        return max(0.0, min(score, 1.0))
+
+    item_records: list[tuple[int, dict[str, Any]]] = []
+
+    for line_index, line in enumerate(lines):
         cleaned = line.strip(" ,:-|\t")
         if not cleaned:
             continue
         lower = cleaned.lower()
-        if any(re.search(pattern, lower) for pattern in IGNORE_LINE_PATTERNS + TOTAL_LABEL_PATTERNS + TAX_LABEL_PATTERNS):
+        if any(re.search(pattern, lower) for pattern in IGNORE_LINE_PATTERNS + TOTAL_LABEL_PATTERNS + TAX_LABEL_PATTERNS + ITEM_IGNORE_PATTERNS):
             continue
         if any(re.search(pattern, lower) for pattern in DATE_PATTERNS):
+            continue
+        if any(re.search(pattern, lower) for pattern in ADDRESS_HINT_PATTERNS):
+            continue
+
+        if not extract_currency_amounts(cleaned) and not re.search(r"\d{4,6}$", cleaned):
             continue
 
         match = None
@@ -713,28 +828,45 @@ def parse_item_lines(lines: list[str], total_amount: float | None = None) -> lis
         if not match:
             continue
 
-        item_name = match.group("name").strip(" -:")
-        amount = normalize_amount_text(match.group("amount"))
+        item_name = clean_item_name(match.group("name"))
+        amount = normalize_item_price(match.group("amount"), cleaned)
         if not item_name or amount is None:
             continue
         if total_amount is not None and abs(amount - total_amount) < 0.01:
             continue
+        if amount <= 0:
+            continue
+
         qty_raw = match.groupdict().get("qty")
+        has_qty = bool(qty_raw)
         if qty_raw:
             try:
                 qty_value = float(qty_raw)
             except ValueError:
                 qty_value = None
             if qty_value and qty_value != 1:
-                item_name = f"{qty_raw} x {item_name}"
+                item_name = item_name
+
+        score = confidence_score(cleaned, item_name, amount, has_qty)
+        if score < 0.62:
+            continue
 
         key = (item_name.lower(), round(amount, 2))
         if key in seen:
             continue
         seen.add(key)
-        items.append({"name": item_name, "price": round(amount, 2)})
+        item_records.append(
+            (
+                line_index,
+                {
+                    "name": item_name,
+                    "price": round(amount, 2),
+                },
+            )
+        )
 
-    return items
+    item_records.sort(key=lambda record: record[0])
+    return [record[1] for record in item_records]
 
 
 def extract_receipt_from_text(raw_text: str) -> dict[str, Any]:
