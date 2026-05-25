@@ -1,4 +1,5 @@
 import datetime as dt
+from io import BytesIO
 import json
 import os
 import re
@@ -9,10 +10,28 @@ from typing import Any
 
 import bcrypt
 import pandas as pd
-import plotly.express as px
+try:
+    import plotly.express as px
+except Exception:  # pragma: no cover - optional at runtime
+    px = None
 import streamlit as st
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional at runtime
+    cv2 = None
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional at runtime
+    np = None
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover - optional at runtime
+    pytesseract = None
 
 try:
     import google.generativeai as genai
@@ -473,40 +492,378 @@ def strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
+TOTAL_LABEL_PATTERNS = [
+    r"grand\s*total",
+    r"net\s*payable",
+    r"amount\s*due",
+    r"balance\s*due",
+    r"amount\s*payable",
+    r"\btotal\b",
+]
+
+TAX_LABEL_PATTERNS = [r"sales\s*tax", r"tax", r"gst", r"vat", r"service\s*tax"]
+
+DATE_PATTERNS = [
+    r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b",
+    r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b",
+    r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b",
+    r"\b[A-Za-z]{3,9}\s+\d{1,2},\s*\d{2,4}\b",
+]
+
+IGNORE_LINE_PATTERNS = [
+    r"thank\s*you",
+    r"receipt",
+    r"invoice",
+    r"subtotal",
+    r"sub\s*total",
+    r"change",
+    r"cash\s*tender",
+    r"payment",
+    r"card\s*ending",
+    r"auth",
+    r"phone",
+    r"address",
+]
+
+
+def preprocess_receipt_image(image: Image.Image) -> Image.Image:
+    if cv2 is None or np is None:
+        resized = image.convert("RGB").resize(
+            (max(image.width * 2, 1), max(image.height * 2, 1))
+        )
+        grayscale = ImageOps.grayscale(resized)
+        sharpened = grayscale.filter(ImageFilter.SHARPEN)
+        thresholded = sharpened.point(lambda pixel: 255 if pixel > 160 else 0)
+        return thresholded
+
+    rgb_image = np.array(image.convert("RGB"))
+    resized = cv2.resize(rgb_image, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
+    grayscale = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(grayscale, -1, sharpen_kernel)
+    thresholded = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return Image.fromarray(thresholded)
+
+
+def normalize_amount_text(value: str) -> float | None:
+    cleaned = re.sub(r"[^\d.,]", "", value or "")
+    cleaned = cleaned.replace(",", "")
+    if not cleaned:
+        return None
+    try:
+        parsed = float(cleaned)
+        return parsed if parsed >= 0 else None
+    except ValueError:
+        return None
+
+
+def extract_currency_amounts(text: str) -> list[float]:
+    matches = re.findall(r"(?:[$€£₹]\s*)?(\d[\d,]*(?:\.\d{1,2})?)", text or "")
+    amounts: list[float] = []
+    for match in matches:
+        amount = normalize_amount_text(match)
+        if amount is not None:
+            amounts.append(amount)
+    return amounts
+
+
+def parse_date_value(raw_date: str | None) -> str | None:
+    if not raw_date:
+        return None
+
+    cleaned = raw_date.strip().replace(",", "")
+    date_formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+        "%m-%d-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+        "%d %b %y",
+        "%d %B %y",
+    ]
+
+    for date_format in date_formats:
+        try:
+            return dt.datetime.strptime(cleaned, date_format).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def extract_merchant_name(lines: list[str]) -> str:
+    candidates: list[tuple[int, str]] = []
+    for index, line in enumerate(lines[:8]):
+        cleaned = line.strip(" ,:-|\t")
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        if any(re.search(pattern, lower) for pattern in IGNORE_LINE_PATTERNS):
+            continue
+        if any(re.search(pattern, lower) for pattern in DATE_PATTERNS):
+            continue
+        if extract_currency_amounts(cleaned):
+            continue
+        letters = sum(1 for char in cleaned if char.isalpha())
+        if letters < 3:
+            continue
+        score = 0
+        if index == 0:
+            score += 3
+        if cleaned.isupper():
+            score += 2
+        if len(cleaned.split()) <= 6:
+            score += 1
+        if letters / max(len(cleaned), 1) > 0.55:
+            score += 1
+        if any(char.isdigit() for char in cleaned):
+            score -= 1
+        candidates.append((score, cleaned))
+
+    if not candidates:
+        return "Unknown Merchant"
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def extract_label_amount(lines: list[str], label_patterns: list[str]) -> float | None:
+    for line in reversed(lines):
+        lower = line.lower()
+        if "subtotal" in lower or "sub total" in lower:
+            continue
+        if not any(re.search(pattern, lower) for pattern in label_patterns):
+            continue
+        amounts = extract_currency_amounts(line)
+        if amounts:
+            return amounts[-1]
+    return None
+
+
+def parse_item_lines(lines: list[str], total_amount: float | None = None) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, float]] = set()
+
+    item_patterns = [
+        re.compile(
+            r"^\s*(?P<qty>\d+(?:\.\d+)?)\s*[xX]?\s+(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{2,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?)\s*$"
+        ),
+        re.compile(
+            r"^\s*(?P<name>[A-Za-z][A-Za-z0-9&'\-/(),.\s]{2,}?)\s+(?P<amount>[€£₹$]?\s*\d[\d,]*(?:\.\d{1,2})?)\s*$"
+        ),
+    ]
+
+    for line in lines:
+        cleaned = line.strip(" ,:-|\t")
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        if any(re.search(pattern, lower) for pattern in IGNORE_LINE_PATTERNS + TOTAL_LABEL_PATTERNS + TAX_LABEL_PATTERNS):
+            continue
+        if any(re.search(pattern, lower) for pattern in DATE_PATTERNS):
+            continue
+
+        match = None
+        for pattern in item_patterns:
+            match = pattern.match(cleaned)
+            if match:
+                break
+
+        if not match:
+            continue
+
+        item_name = match.group("name").strip(" -:")
+        amount = normalize_amount_text(match.group("amount"))
+        if not item_name or amount is None:
+            continue
+        if total_amount is not None and abs(amount - total_amount) < 0.01:
+            continue
+        qty_raw = match.groupdict().get("qty")
+        if qty_raw:
+            try:
+                qty_value = float(qty_raw)
+            except ValueError:
+                qty_value = None
+            if qty_value and qty_value != 1:
+                item_name = f"{qty_raw} x {item_name}"
+
+        key = (item_name.lower(), round(amount, 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"name": item_name, "price": round(amount, 2)})
+
+    return items
+
+
+def extract_receipt_from_text(raw_text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+    amount_lines = [
+        line
+        for line in lines
+        if not any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in DATE_PATTERNS)
+    ]
+    all_amounts: list[float] = []
+    for line in amount_lines:
+        all_amounts.extend(extract_currency_amounts(line))
+    total_amount = extract_label_amount(lines, TOTAL_LABEL_PATTERNS)
+    tax_amount = extract_label_amount(lines, TAX_LABEL_PATTERNS)
+    date_value = None
+
+    for line in lines:
+        for pattern in DATE_PATTERNS:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if match:
+                date_value = parse_date_value(match.group(0))
+                if date_value:
+                    break
+        if date_value:
+            break
+
+    if total_amount is None and all_amounts:
+        total_amount = max(all_amounts)
+
+    items = parse_item_lines(lines, total_amount=total_amount)
+    merchant = extract_merchant_name(lines)
+
+    return {
+        "merchant": merchant,
+        "amount": round(total_amount or 0.0, 2),
+        "tax": round(tax_amount or 0.0, 2),
+        "date": date_value or dt.date.today().isoformat(),
+        "items": items,
+    }
+
+
+def extract_receipt_with_gemini(image: Image.Image, raw_text: str) -> dict[str, Any] | None:
     model = get_gemini_model()
     if not model:
-        return {
-            "merchant": "Unknown Merchant",
-            "amount": 0.0,
-            "tax": 0.0,
-            "date": dt.date.today().isoformat(),
-            "items": [],
-        }
+        return None
 
     try:
-        image = Image.open(uploaded_file)
         prompt = (
-            "Extract merchant, total amount, tax, date (YYYY-MM-DD), and items from this receipt. "
-            "Return strict JSON with keys: merchant, amount, tax, date, items."
+            "You are extracting structured data from a receipt. "
+            "Return strict JSON with keys merchant, amount, tax, date, items. "
+            "If items are visible, include objects with name and price. "
+            "Use the OCR text as supporting context, but correct obvious OCR mistakes.\n\n"
+            f"OCR text:\n{raw_text or '[no OCR text]'}"
         )
         response = model.generate_content([prompt, image])
         payload = json.loads(strip_code_fences(response.text or "{}"))
+
+        parsed_items = []
+        for item in payload.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            price = normalize_amount_text(str(item.get("price", "")))
+            name = str(item.get("name", "")).strip()
+            if name and price is not None:
+                parsed_items.append({"name": name, "price": round(price, 2)})
+
         return {
-            "merchant": payload.get("merchant", "Unknown Merchant"),
-            "amount": float(payload.get("amount", 0.0) or 0.0),
-            "tax": float(payload.get("tax", 0.0) or 0.0),
-            "date": payload.get("date") or dt.date.today().isoformat(),
-            "items": payload.get("items", []) or [],
+            "merchant": str(payload.get("merchant", "")).strip() or None,
+            "amount": normalize_amount_text(str(payload.get("amount", ""))),
+            "tax": normalize_amount_text(str(payload.get("tax", ""))),
+            "date": parse_date_value(str(payload.get("date", ""))) or None,
+            "items": parsed_items,
         }
     except Exception:
+        return None
+
+
+def merge_receipt_data(local_data: dict[str, Any], gemini_data: dict[str, Any] | None) -> dict[str, Any]:
+    if not gemini_data:
+        result = dict(local_data)
+        result["source"] = "pytesseract+regex"
+        return result
+
+    merged = dict(local_data)
+
+    if gemini_data.get("merchant") and gemini_data.get("merchant") != "Unknown Merchant":
+        merged["merchant"] = gemini_data["merchant"]
+
+    if gemini_data.get("amount") not in (None, 0, 0.0):
+        merged["amount"] = float(gemini_data["amount"])
+
+    if gemini_data.get("tax") not in (None, 0, 0.0):
+        merged["tax"] = float(gemini_data["tax"])
+
+    if gemini_data.get("date"):
+        merged["date"] = gemini_data["date"]
+
+    if gemini_data.get("items"):
+        merged["items"] = gemini_data["items"]
+
+    merged["source"] = "pytesseract+regex+gemini"
+    return merged
+
+
+def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
+    try:
+        image_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except Exception as error:
         return {
             "merchant": "Unknown Merchant",
             "amount": 0.0,
             "tax": 0.0,
             "date": dt.date.today().isoformat(),
             "items": [],
+            "raw_text": "",
+            "ocr_notes": [f"Unable to open image: {error}"],
+            "source": "error",
         }
+
+    notes: list[str] = []
+    raw_text = ""
+
+    try:
+        processed_image = preprocess_receipt_image(image)
+        tesseract_errors: list[str] = []
+
+        if pytesseract is None:
+            tesseract_errors.append("pytesseract is not installed in this environment.")
+        else:
+            ocr_configs = ["--psm 6", "--psm 11", "--psm 4"]
+            for config in ocr_configs:
+                try:
+                    candidate_text = pytesseract.image_to_string(processed_image, config=config)
+                    if candidate_text and candidate_text.strip():
+                        raw_text = candidate_text.strip()
+                        notes.append(f"Local OCR succeeded with {config}.")
+                        break
+                except Exception as error:
+                    tesseract_errors.append(f"{config}: {error}")
+
+            if not raw_text:
+                notes.append("Local OCR did not produce readable text; trying Gemini fallback.")
+                if tesseract_errors:
+                    notes.extend(tesseract_errors[:2])
+
+        local_data = extract_receipt_from_text(raw_text)
+        gemini_data = extract_receipt_with_gemini(image, raw_text)
+        receipt = merge_receipt_data(local_data, gemini_data)
+
+        if not raw_text:
+            notes.append("No raw OCR text was recovered from the uploaded image.")
+
+        receipt["raw_text"] = raw_text
+        receipt["ocr_notes"] = notes
+        return receipt
+    except Exception as error:
+        fallback = extract_receipt_from_text(raw_text)
+        fallback.update(
+            {
+                "raw_text": raw_text,
+                "ocr_notes": notes + [f"OCR pipeline failed: {error}"],
+                "source": "regex-fallback",
+            }
+        )
+        return fallback
 
 
 def ai_chat_reply(user_message: str, expenses: list[dict[str, Any]], monthly_budget: float) -> str:
@@ -672,12 +1029,24 @@ def show_dashboard(user: dict[str, Any]) -> None:
 
     if stats["categoryTotals"]:
         cat_df = pd.DataFrame(stats["categoryTotals"])
-        st.plotly_chart(px.pie(cat_df, names="category", values="amount", title="Expense by Category"), use_container_width=True)
+        if px is not None:
+            st.plotly_chart(
+                px.pie(cat_df, names="category", values="amount", title="Expense by Category"),
+                use_container_width=True,
+            )
+        else:
+            st.bar_chart(cat_df.set_index("category")["amount"], use_container_width=True)
 
     if stats["trends"]:
         trend_df = pd.DataFrame(stats["trends"])
         trend_df["date"] = pd.to_datetime(trend_df["date"])
-        st.plotly_chart(px.line(trend_df, x="date", y="amount", title="30-Day Net Cashflow Trend"), use_container_width=True)
+        if px is not None:
+            st.plotly_chart(
+                px.line(trend_df, x="date", y="amount", title="30-Day Net Cashflow Trend"),
+                use_container_width=True,
+            )
+        else:
+            st.line_chart(trend_df.set_index("date")["amount"], use_container_width=True)
 
     st.subheader("Recent Transactions")
     recent_df = pd.DataFrame(stats["recent"]) if stats["recent"] else pd.DataFrame()
@@ -863,6 +1232,13 @@ def show_ocr_scanner(user: dict[str, Any]) -> None:
 
     st.subheader("Parsed Receipt")
     st.json(data)
+
+    if data.get("ocr_notes"):
+        for note in data["ocr_notes"]:
+            st.caption(note)
+
+    with st.expander("Raw OCR text", expanded=False):
+        st.text(data.get("raw_text") or "No OCR text recovered.")
 
     default_description = "Parsed receipt"
     if data.get("items"):
