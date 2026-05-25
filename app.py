@@ -3,6 +3,7 @@ from io import BytesIO
 import json
 import os
 import re
+import shutil
 import sqlite3
 import uuid
 from pathlib import Path
@@ -492,6 +493,42 @@ def strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+def detect_tesseract_binary() -> str | None:
+    configured_path = os.getenv("TESSERACT_CMD") or os.getenv("TESSERACT_PATH")
+    if configured_path and Path(configured_path).exists():
+        return configured_path
+
+    detected_path = shutil.which("tesseract")
+    if detected_path:
+        return detected_path
+
+    if os.name == "nt":
+        possible_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            str(Path.home() / r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+        ]
+        for path in possible_paths:
+            if Path(path).exists():
+                return path
+    else:
+        for path in ("/usr/bin/tesseract", "/usr/local/bin/tesseract"):
+            if Path(path).exists():
+                return path
+
+    return None
+
+
+def configure_tesseract_binary() -> str | None:
+    if pytesseract is None:
+        return None
+
+    binary_path = detect_tesseract_binary()
+    if binary_path:
+        pytesseract.pytesseract.tesseract_cmd = binary_path
+    return binary_path
+
+
 TOTAL_LABEL_PATTERNS = [
     r"grand\s*total",
     r"net\s*payable",
@@ -823,11 +860,17 @@ def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
 
     try:
         processed_image = preprocess_receipt_image(image)
+        tesseract_binary = configure_tesseract_binary()
         tesseract_errors: list[str] = []
 
         if pytesseract is None:
             tesseract_errors.append("pytesseract is not installed in this environment.")
+        elif not tesseract_binary:
+            tesseract_errors.append(
+                "Tesseract binary was not found. Using regex fallback; install Tesseract locally or add tesseract-ocr packages on Streamlit Cloud."
+            )
         else:
+            notes.append(f"Using Tesseract binary: {tesseract_binary}")
             ocr_configs = ["--psm 6", "--psm 11", "--psm 4"]
             for config in ocr_configs:
                 try:
@@ -843,6 +886,9 @@ def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
                 notes.append("Local OCR did not produce readable text; trying Gemini fallback.")
                 if tesseract_errors:
                     notes.extend(tesseract_errors[:2])
+
+        if tesseract_errors and not raw_text:
+            notes.extend(tesseract_errors[:2])
 
         local_data = extract_receipt_from_text(raw_text)
         gemini_data = extract_receipt_with_gemini(image, raw_text)
@@ -1235,6 +1281,9 @@ def show_ocr_scanner(user: dict[str, Any]) -> None:
 
     if data.get("ocr_notes"):
         for note in data["ocr_notes"]:
+            if "not found" in note.lower() or "not installed" in note.lower():
+                st.warning(note)
+                continue
             st.caption(note)
 
     with st.expander("Raw OCR text", expanded=False):
