@@ -841,7 +841,12 @@ def merge_receipt_data(local_data: dict[str, Any], gemini_data: dict[str, Any] |
 
 def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
     try:
-        image_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        if isinstance(uploaded_file, (bytes, bytearray)):
+            image_bytes = bytes(uploaded_file)
+        elif hasattr(uploaded_file, "getvalue"):
+            image_bytes = uploaded_file.getvalue()
+        else:
+            image_bytes = uploaded_file.read()
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
     except Exception as error:
         return {
@@ -851,11 +856,11 @@ def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
             "date": dt.date.today().isoformat(),
             "items": [],
             "raw_text": "",
-            "ocr_notes": [f"Unable to open image: {error}"],
+            "ocr_notes": ["OCR started", f"Unable to open image: {error}"],
             "source": "error",
         }
 
-    notes: list[str] = []
+    notes: list[str] = ["OCR started"]
     raw_text = ""
 
     try:
@@ -865,12 +870,14 @@ def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
 
         if pytesseract is None:
             tesseract_errors.append("pytesseract is not installed in this environment.")
+            notes.append("Tesseract not available")
         elif not tesseract_binary:
             tesseract_errors.append(
                 "Tesseract binary was not found. Using regex fallback; install Tesseract locally or add tesseract-ocr packages on Streamlit Cloud."
             )
+            notes.append("Tesseract not detected")
         else:
-            notes.append(f"Using Tesseract binary: {tesseract_binary}")
+            notes.append(f"Tesseract detected: {tesseract_binary}")
             ocr_configs = ["--psm 6", "--psm 11", "--psm 4"]
             for config in ocr_configs:
                 try:
@@ -892,12 +899,15 @@ def parse_receipt(uploaded_file: Any) -> dict[str, Any]:
 
         local_data = extract_receipt_from_text(raw_text)
         gemini_data = extract_receipt_with_gemini(image, raw_text)
+        if gemini_data is not None:
+            notes.append("Gemini fallback used")
         receipt = merge_receipt_data(local_data, gemini_data)
 
         if not raw_text:
             notes.append("No raw OCR text was recovered from the uploaded image.")
 
         receipt["raw_text"] = raw_text
+        notes.append("OCR completed")
         receipt["ocr_notes"] = notes
         return receipt
     except Exception as error:
@@ -1266,28 +1276,48 @@ def show_ocr_scanner(user: dict[str, Any]) -> None:
     st.header("OCR Receipt Scanner")
     uploaded = st.file_uploader("Upload receipt image", type=["png", "jpg", "jpeg", "webp"])
 
+    st.session_state.setdefault("parsed_receipt", None)
+    st.session_state.setdefault("raw_ocr_text", "")
+    st.session_state.setdefault("ocr_debug_logs", [])
+
     if uploaded is not None:
         st.image(uploaded, caption="Uploaded receipt", use_container_width=True)
         if st.button("Parse Receipt"):
-            data = parse_receipt(uploaded)
-            st.session_state.receipt_data = data
+            try:
+                with st.spinner("Parsing receipt..."):
+                    image_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+                    st.session_state.ocr_debug_logs = ["OCR started"]
+                    data = parse_receipt(image_bytes)
+                    st.session_state.parsed_receipt = data
+                    st.session_state.raw_ocr_text = data.get("raw_text", "")
+                    st.session_state.receipt_data = data
+                    st.session_state.ocr_debug_logs = data.get("ocr_notes", st.session_state.ocr_debug_logs)
+                    st.success("Receipt parsed successfully.")
+                    st.rerun()
+            except Exception as error:
+                st.error(f"OCR failed: {error}")
+                st.session_state.ocr_debug_logs = st.session_state.get("ocr_debug_logs", []) + [
+                    f"OCR pipeline failed: {error}"
+                ]
 
-    data = st.session_state.get("receipt_data")
+    data = st.session_state.get("parsed_receipt") or st.session_state.get("receipt_data")
     if not data:
         return
 
     st.subheader("Parsed Receipt")
     st.json(data)
 
-    if data.get("ocr_notes"):
-        for note in data["ocr_notes"]:
-            if "not found" in note.lower() or "not installed" in note.lower():
+    debug_logs = st.session_state.get("ocr_debug_logs") or data.get("ocr_notes") or []
+    if debug_logs:
+        for note in debug_logs:
+            lower_note = note.lower()
+            if "not found" in lower_note or "not installed" in lower_note or "not detected" in lower_note or "failed" in lower_note:
                 st.warning(note)
-                continue
-            st.caption(note)
+            else:
+                st.caption(note)
 
     with st.expander("Raw OCR text", expanded=False):
-        st.text(data.get("raw_text") or "No OCR text recovered.")
+        st.text(st.session_state.get("raw_ocr_text") or data.get("raw_text") or "No OCR text recovered.")
 
     default_description = "Parsed receipt"
     if data.get("items"):
